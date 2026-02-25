@@ -1,1476 +1,865 @@
 import SwiftUI
-import PDFKit
-import Foundation
 import Speech
 import AVFoundation
-import Combine
 import UIKit
-import RevenueCatUI
+import PDFKit
+import Combine
+// MARK: - Design System
+
+extension Color {
+    static let ink       = Color(white: 0.06)
+    static let inkLight  = Color(white: 0.14)
+    static let inkMid    = Color(white: 0.24)
+    static let fog       = Color(white: 0.58)
+    static let paper     = Color(white: 0.96)
+    static let accent    = Color(red: 1.0, green: 0.36, blue: 0.22) // warm vermillion
+}
+
+// Monospaced timing font helper
+extension Font {
+    static func mono(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight, design: .monospaced)
+    }
+    static func serif(_ size: CGFloat, weight: Font.Weight = .regular) -> Font {
+        .system(size: size, weight: weight, design: .serif)
+    }
+}
+
 // MARK: - Data Models
 
-struct Transcription: Identifiable, Equatable, Codable {
+struct Meeting: Identifiable, Equatable, Codable {
     let id: UUID
-    let text: String
+    var transcript: String
     let date: Date
     var title: String
-    var tags: [String]
-    var isFavorite: Bool
-    
-    init(id: UUID = UUID(), text: String, date: Date = Date(), title: String = "", tags: [String] = [], isFavorite: Bool = false) {
+    var duration: TimeInterval
+    var segments: [TranscriptSegment]
+
+    init(id: UUID = UUID(), transcript: String, date: Date = Date(),
+         title: String = "", duration: TimeInterval = 0, segments: [TranscriptSegment] = []) {
         self.id = id
-        self.text = text
+        self.transcript = transcript
         self.date = date
-        self.title = title.isEmpty ? "Note \(date.formatted(date: .abbreviated, time: .shortened))" : title
-        self.tags = tags
-        self.isFavorite = isFavorite
+        self.title = title.isEmpty ? Self.defaultTitle(date) : title
+        self.duration = duration
+        self.segments = segments
     }
-    
-    static func == (lhs: Transcription, rhs: Transcription) -> Bool {
-        lhs.id == rhs.id
+
+    static func defaultTitle(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "MMM d · h:mm a"
+        return f.string(from: date)
+    }
+
+    static func == (lhs: Meeting, rhs: Meeting) -> Bool { lhs.id == rhs.id }
+}
+
+struct TranscriptSegment: Identifiable, Codable {
+    let id: UUID
+    var speaker: String
+    var text: String
+    var timestamp: TimeInterval
+
+    init(id: UUID = UUID(), speaker: String, text: String, timestamp: TimeInterval) {
+        self.id = id; self.speaker = speaker; self.text = text; self.timestamp = timestamp
     }
 }
 
-// MARK: - Main View
+// MARK: - Recording Manager
 
-struct SpeechToTextView: View {
-    @StateObject private var manager = SpeechRecognitionManager()
-    @State private var showCopiedToast = false
-    @State private var showShareSheet = false
-    @State private var exportURL: URL?
-    @State private var showHistory = false
-    @State private var pulseAnimation = false
-    @State private var showTextEditor = false
-    @State private var toastMessage = ""
-    @State private var shareItem: ShareItem?
-    @State private var showPaywall = false
-    @EnvironmentObject var subscriptionManager: SubscriptionManager
+final class RecordingManager: ObservableObject {
+    @Published var isRecording   = false
+    @Published var isPaused      = false
+    @Published var liveText      = ""
+    @Published var segments: [TranscriptSegment] = []
+    @Published var history: [Meeting] = []
+    @Published var errorMessage: String?
 
+    private let engine = AVAudioEngine()
+    private var recognizer: SFSpeechRecognizer?
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private var audioRecorder: AVAudioRecorder?
+    private var sessionActive = false
+    private var startTime: Date?
+    private(set) var currentAudioURL: URL?
 
-    @AppStorage("mustShowPaywall") private var mustShowPaywall = false
- 
-    @State private var recordTapCount = 0
+    init() {
+        recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+        loadHistory()
+        requestPermissions()
+    }
 
+    // MARK: Permissions
+    private func requestPermissions() {
+        SFSpeechRecognizer.requestAuthorization { _ in }
+        AVAudioSession.sharedInstance().requestRecordPermission { _ in }
+    }
 
+    // MARK: Toggle
+    func toggleRecording() {
+        isRecording ? stop() : start()
+    }
+
+    func togglePause() {
+        isPaused.toggle()
+        if isPaused {
+            audioRecorder?.pause()
+        } else {
+            audioRecorder?.record()
+        }
+    }
+
+    // MARK: Start
+    private func start() {
+        guard let rec = recognizer, rec.isAvailable else {
+            errorMessage = "Speech recognition unavailable."
+            return
+        }
+        do {
+            let session = AVAudioSession.sharedInstance()
+            try session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
+            try session.setActive(true)
+            sessionActive = true
+        } catch {
+            errorMessage = "Audio session failed."
+            return
+        }
+
+        // Audio file
+        let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("rec_\(UUID().uuidString).m4a")
+        let settings: [String: Any] = [
+            AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
+            AVSampleRateKey: 44100,
+            AVNumberOfChannelsKey: 1,
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
+        ]
+        audioRecorder = try? AVAudioRecorder(url: url, settings: settings)
+        audioRecorder?.record()
+        currentAudioURL = url
+
+        // Recognition
+        request = SFSpeechAudioBufferRecognitionRequest()
+        request?.shouldReportPartialResults = true
+
+        let inputNode = engine.inputNode
+        inputNode.removeTap(onBus: 0)
+        let fmt = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buf, _ in
+            self?.request?.append(buf)
+        }
+
+        task = rec.recognitionTask(with: request!) { [weak self] result, error in
+            guard let self else { return }
+            if let result = result {
+                DispatchQueue.main.async {
+                    let txt = result.bestTranscription.formattedString
+                    if self.segments.isEmpty {
+                        self.segments.append(TranscriptSegment(
+                            speaker: "Speaker 1", text: txt,
+                            timestamp: Date().timeIntervalSince(self.startTime ?? Date())))
+                    } else {
+                        self.segments[self.segments.count - 1].text = txt
+                    }
+                    self.liveText = txt
+                }
+            }
+        }
+
+        engine.prepare()
+        try? engine.start()
+        startTime = Date()
+        isRecording = true
+        isPaused    = false
+    }
+
+    // MARK: Stop
+    func stop() {
+        engine.stop()
+        engine.inputNode.removeTap(onBus: 0)
+        request?.endAudio()
+        task?.cancel()
+        request = nil; task = nil
+        audioRecorder?.stop()
+        if sessionActive {
+            try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+            sessionActive = false
+        }
+        isRecording = false
+        isPaused    = false
+    }
+
+    // MARK: Save
+    func save(duration: TimeInterval) {
+        guard !segments.isEmpty else { return }
+        let full = segments.map(\.text).joined(separator: " ")
+        let m = Meeting(transcript: full, duration: duration, segments: segments)
+        history.insert(m, at: 0)
+        saveHistory()
+    }
+
+    func discard() {
+        segments = []
+        liveText  = ""
+    }
+
+    // MARK: Delete
+    func delete(_ meeting: Meeting) {
+        history.removeAll { $0.id == meeting.id }
+        saveHistory()
+    }
+
+    // MARK: Persistence
+    private func saveHistory() {
+        if let data = try? JSONEncoder().encode(history) {
+            UserDefaults.standard.set(data, forKey: "meetings_v2")
+        }
+    }
+    private func loadHistory() {
+        guard let data = UserDefaults.standard.data(forKey: "meetings_v2"),
+              let arr = try? JSONDecoder().decode([Meeting].self, from: data) else { return }
+        history = arr
+    }
+}
+
+// MARK: - Root
+
+struct ContentView: View {
+    @StateObject private var recorder = RecordingManager()
+    @State private var tab: Tab = .record
+
+    enum Tab { case record, history }
 
     var body: some View {
-        ZStack {
-            VStack(spacing: 0) {
-                // Header
-                headerView
-                
-                // Text Editor Area
-                textEditorArea
-                
-                // Bottom Controls
-                bottomControls
+        ZStack(alignment: .bottom) {
+            Color.paper.ignoresSafeArea()
+
+            Group {
+                if tab == .record {
+                    RecordView(recorder: recorder)
+                        .transition(.opacity)
+                } else {
+                    HistoryView(recorder: recorder)
+                        .transition(.opacity)
+                }
             }
-            
-            // History Sidebar
-            if showHistory {
-                HistoryView(
-                    isShowing: $showHistory,
-                    transcriptions: $manager.transcriptionHistory,
-                    onSelect: { transcription in
-                        manager.transcribedText = transcription.text
-                        generateHaptic(.light)
-                    },
-                    onDelete: { transcription in
-                        if let index = manager.transcriptionHistory.firstIndex(where: { $0.id == transcription.id }) {
-                            manager.transcriptionHistory.remove(at: index)
-                            manager.saveHistory()
-                        }
-                    },
-                    onToggleFavorite: { transcription in
-                        manager.toggleFavorite(transcription)
-                    }
-                )
-                .transition(.move(edge: .trailing))
-                .zIndex(1)
-            }
-            
-            // Advanced Text Editor
-            if showTextEditor {
-                AdvancedTextEditorView(
-                    text: $manager.transcribedText,
-                    isShowing: $showTextEditor,
-                    onSave: {
-                        manager.saveCurrentTranscription()
-                        showToast("Saved successfully")
-                    }
-                )
-                .transition(.move(edge: .bottom))
-                .zIndex(2)
-            }
-            
-            // Toast
-            if !toastMessage.isEmpty {
-                toastView
-            }
+            .animation(.easeInOut(duration: 0.2), value: tab)
+
+            BottomBar(tab: $tab)
         }
-        .alert(isPresented: $manager.showAlert) {
-            Alert(
-                title: Text("Error"),
-                message: Text(manager.alertMessage),
-                dismissButton: .default(Text("OK"))
-            )
-        }
-        .sheet(item: $shareItem) { item in
-            ActivityViewController(activityItems: item.items)
-        }
+        .preferredColorScheme(.light)
     }
-    
-    // MARK: - Subviews
-    
-    private var headerView: some View {
-        HStack {
-            // Title - left
-            Text("Transcribe")
-                .font(.system(size: 28, weight: .bold))
-                .lineLimit(1)
-            
-            Spacer()
-            
-            // PRO capsule - center
-            Button(action: {
-                generateHaptic(.light)
-                
-                // Only show paywall if user is NOT subscribed
-                if !subscriptionManager.isSubscribed {
-                    showPaywall = true
-                } else {
-                    print("User is already subscribed")
-                    // Optionally: show a message or do nothing
-                }
-            }) {
-                HStack(spacing: 4) {
-                    Image(systemName: "crown.fill")
-                        .font(.system(size: 12))
-                        .foregroundColor(.yellow)
-                    Text("PRO")
-                        .font(.caption2)
-                        .fontWeight(.bold)
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(
-                            LinearGradient(
-                                colors: [.yellow, .orange],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                        .clipShape(Capsule())
-                        .shadow(radius: 1)
-                }
-            }
-            .buttonStyle(.plain)
-            .sheet(isPresented: $showPaywall) {
-                PaywallView()
-            }
+}
 
-            
-            Spacer()
-            
-            // Clock button - right
-            Button(action: {
-                generateHaptic(.light)
+// MARK: - Bottom Bar
 
-                if !subscriptionManager.isSubscribed {
-                    showPaywall = true
-                } else {
-                    print("User is already subscribed")
-                    withAnimation(.spring()) {
-                        showHistory.toggle()
-                    }
-                }
-            }) {
-                ZStack(alignment: .topTrailing) {
-                    Image(systemName: "clock.arrow.circlepath")
-                        .font(.system(size: 22))
-                        .foregroundColor(.blue)
-                        .padding(8)
-                        .background(Color(.systemGray6))
-                        .clipShape(Circle())
+struct BottomBar: View {
+    @Binding var tab: ContentView.Tab
 
-                    if !manager.transcriptionHistory.isEmpty {
-                        Text("\(manager.transcriptionHistory.count)")
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(4)
-                            .background(Color.red)
-                            .clipShape(Circle())
-                            .offset(x: 6, y: -2)
-                    }
-                }
-            }
-
-
+    var body: some View {
+        HStack(spacing: 0) {
+            tabButton("mic",     label: "RECORD",  t: .record)
+            tabButton("list.bullet", label: "NOTES", t: .history)
         }
-        .padding(.horizontal)
-        .padding(.vertical, 12)
-        .background(Color(.systemBackground))
-        .shadow(color: .black.opacity(0.05), radius: 3, y: 2)
-        .sheet(isPresented: $showPaywall) {
-            PaywallView()
-        }
+        .background(Color.paper.shadow(.inner(color: .black.opacity(0.06), radius: 0, y: -1)))
     }
 
-
-
-    private var textEditorArea: some View {
-        ZStack(alignment: .topTrailing) {
-            TextEditor(text: $manager.transcribedText)
-                .font(.system(size: 17))
-                .padding(16)
-                .background(Color(.systemBackground))
-                .disabled(manager.isRecording)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16)
-                        .stroke(manager.isRecording ? Color.red.opacity(0.3) : Color(.systemGray5), lineWidth: 2)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                )
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
-            
-            if manager.transcribedText.isEmpty {
-                VStack(spacing: 12) {
-                    Image(systemName: "waveform.circle.fill")
-                        .font(.system(size: 56))
-                        .foregroundColor(.blue.opacity(0.3))
-                    
-                    Text("Tap record to start")
-                        .font(.headline)
-                        .foregroundColor(.gray)
-                    
-                    Text("Your transcription will appear here")
-                        .font(.subheadline)
-                        .foregroundColor(.gray.opacity(0.7))
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .allowsHitTesting(false)
-            }
-            
-            // Word count badge
-            if !manager.transcribedText.isEmpty {
-                HStack(spacing: 4) {
-                    Image(systemName: "text.word.spacing")
-                        .font(.caption2)
-                    Text("\(wordCount)")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
-                .background(
-                    Capsule()
-                        .fill(Color.blue)
-                        .shadow(color: .blue.opacity(0.3), radius: 4)
-                )
-                .foregroundColor(.white)
-                .padding(.trailing, 20)
-                .padding(.top, 12)
-            }
-        }
-        .frame(maxHeight: .infinity)
-    }
-    
-    private var bottomControls: some View {
-        VStack(spacing: 16) {
-            // Record button
-            Button(action: {
-                generateHaptic(.medium)
-
-                // 🚫 If user is locked & not subscribed → force paywall
-                if mustShowPaywall && !subscriptionManager.isSubscribed {
-                    showPaywall = true
-                    return
-                }
-
-                // 👇 Count taps for NON-SUB users only
-                if !subscriptionManager.isSubscribed {
-                    recordTapCount += 1
-
-                    if recordTapCount == 5 {
-                        mustShowPaywall = true   // 🔒 persist lock
-                        showPaywall = true
-                        recordTapCount = 0
-                        return
-                    }
-                }
-
-                // 🎙 Existing logic (UNCHANGED)
-                manager.toggleRecording()
-
-                if manager.isRecording {
-                    withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
-                        pulseAnimation = true
-                    }
-                } else {
-                    withAnimation(.easeOut(duration: 0.2)) {
-                        pulseAnimation = false
-                    }
-                }
-
-            }) {
-                // 👇 UI UNCHANGED
-                HStack(spacing: 16) {
-                    Image(systemName: manager.isRecording ? "stop.circle.fill" : "mic.circle.fill")
-                        .font(.system(size: 24, weight: .medium))
-                        .scaleEffect(manager.isRecording ? 1.1 : 1.0)
-                        .scaleEffect(pulseAnimation ? 1.15 : 1.0)
-                        .animation(.spring(response: 0.3, dampingFraction: 0.7), value: manager.isRecording)
-
-                    Text(manager.isRecording ? "Stop Recording" : "Start Recording")
-                        .font(.system(size: 17, weight: .medium))
-                }
-                .foregroundColor(.white)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 18)
-                .background(
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(manager.isRecording ? Color.red.opacity(0.9) : Color.blue.opacity(0.9))
-                )
-            }
-            .padding(.horizontal)
-
-
-            
-            // Action buttons
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
-                    ActionButton(icon: "square.and.pencil", title: "Edit", color: .purple) {
-                        generateHaptic(.light)
-                        withAnimation(.spring()) { showTextEditor = true }
-                    }
-                    .disabled(manager.transcribedText.isEmpty)
-                    
-                    ActionButton(icon: "doc.on.doc", title: "Copy", color: .green) {
-                        generateHaptic(.light)
-                        UIPasteboard.general.string = manager.transcribedText
-                        showToast("Copied to clipboard")
-                    }
-                    .disabled(manager.transcribedText.isEmpty)
-                    
-                    ActionButton(icon: "square.and.arrow.up", title: "Share", color: .blue) {
-                        generateHaptic(.light)
-                        
-                        // Only show paywall if user is not subscribed
-                        if !subscriptionManager.isSubscribed {
-                            showPaywall = true
-                        } else {
-                            // User is subscribed — perform the normal action instead
-                            shareText()
-                        }
-                    }
-                    .disabled(manager.transcribedText.isEmpty)
-                    .sheet(isPresented: $showPaywall) {
-                        PaywallView()
-                    }
-
-
-                    
-                    ActionButton(icon: "doc.text", title: "PDF", color: .orange) {
-                        generateHaptic(.light)
-                        
-                        if subscriptionManager.isSubscribed {
-                            // ✅ Subscribed: allow PDF export
-                            exportAsPDF()
-                        } else {
-                            // 🚫 Not subscribed: show paywall
-                            showPaywall = true
-                        }
-                    }
-                    .disabled(manager.transcribedText.isEmpty)
-                    
-                    ActionButton(icon: "arrow.down.doc", title: "Save", color: .teal) {
-                        generateHaptic(.light)
-                        manager.saveCurrentTranscription()
-                        showToast("Saved to history")
-                    }
-                    .disabled(manager.transcribedText.isEmpty)
-                    
-                    ActionButton(icon: "trash", title: "Clear", color: .red) {
-                        generateHaptic(.medium)
-                        withAnimation(.spring()) { manager.transcribedText = "" }
-                    }
-                    .disabled(manager.transcribedText.isEmpty)
-                }
-                .padding(.horizontal)
-            }.sheet(isPresented: $showPaywall) {
-                PaywallView(displayCloseButton: true)
-                    .preferredColorScheme(.light)
+    private func tabButton(_ icon: String, label: String, t: ContentView.Tab) -> some View {
+        Button { tab = t } label: {
+            VStack(spacing: 4) {
+                Image(systemName: tab == t ? icon + ".fill" : icon)
+                    .font(.system(size: 18, weight: .regular))
+                    .foregroundColor(tab == t ? .accent : .fog)
+                Text(label)
+                    .font(.mono(9, weight: .medium))
+                    .tracking(1.5)
+                    .foregroundColor(tab == t ? .accent : .fog)
             }
             .frame(maxWidth: .infinity)
-            .contentShape(Rectangle())
-            .gesture(DragGesture())
-        }
-        .padding(.vertical, 16)
-        .background(
-            Color(.systemBackground)
-                .shadow(color: .black.opacity(0.08), radius: 10, y: -5)
-        )
-    }
-    
-    private var toastView: some View {
-        VStack {
-            HStack(spacing: 10) {
-                Image(systemName: "checkmark.circle.fill")
-                    .foregroundColor(.green)
-                    .font(.system(size: 20))
-                Text(toastMessage)
-                    .font(.subheadline)
-                    .fontWeight(.medium)
-            }
-            .padding(.horizontal, 24)
             .padding(.vertical, 14)
-            .background(
-                Capsule()
-                    .fill(Color(.systemBackground))
-                    .shadow(color: .black.opacity(0.15), radius: 10, y: 5)
-            )
-            .padding(.top, 80)
-            
-            Spacer()
         }
-        .transition(.move(edge: .top).combined(with: .opacity))
-        .zIndex(3)
-        .onAppear {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                withAnimation {
-                    toastMessage = ""
-                }
-            }
-        }
-    }
-    
-    // MARK: - Helper Properties
-    
-    private var wordCount: Int {
-        manager.transcribedText.split { $0 == " " || $0.isNewline }.count
-    }
-    
-    // MARK: - Helper Methods
-    
-    private func generateHaptic(_ style: UIImpactFeedbackGenerator.FeedbackStyle) {
-        let generator = UIImpactFeedbackGenerator(style: style)
-        generator.impactOccurred()
-    }
-    
-    private func showToast(_ message: String) {
-        withAnimation {
-            toastMessage = message
-        }
-    }
-    
-    private func shareText() {
-        shareItem = ShareItem(items: [manager.transcribedText])
-    }
-    
-    private func exportAsPDF() {
-        let fileName = "VoiceNote_\(Date().formatted(date: .abbreviated, time: .shortened))"
-            .replacingOccurrences(of: "/", with: "-")
-            .replacingOccurrences(of: ":", with: "-")
-        
-        if let url = generateTranscriptionPDF(
-            title: "Voice Transcription",
-            subtitle: nil,
-            text: manager.transcribedText,
-            fileName: fileName
-        ) {
-            shareItem = ShareItem(items: [url])
-        } else {
-            showToast("Failed to generate PDF")
-        }
-    }
-    
-    func generateTranscriptionPDF(
-        title: String = "Voice Transcription",
-        subtitle: String? = nil,
-        text: String,
-        fileName: String = "Transcription.pdf"
-    ) -> URL? {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            print("❌ No text to export")
-            return nil
-        }
-        
-        let safeFileName = fileName.replacingOccurrences(of: " ", with: "_")
-        let url = FileManager.default.temporaryDirectory.appendingPathComponent("\(safeFileName).pdf")
-        
-        let pageWidth: CGFloat = 595.2
-        let pageHeight: CGFloat = 841.8
-        let margin: CGFloat = 50
-        let textWidth = pageWidth - 2 * margin
-        
-        let renderer = UIGraphicsPDFRenderer(bounds: CGRect(x: 0, y: 0, width: pageWidth, height: pageHeight))
-        
-        do {
-            try renderer.writePDF(to: url) { context in
-                let titleAttrs: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.boldSystemFont(ofSize: 22),
-                    .foregroundColor: UIColor.black
-                ]
-                let subtitleAttrs: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.systemFont(ofSize: 14),
-                    .foregroundColor: UIColor.darkGray
-                ]
-                let dateAttrs: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.systemFont(ofSize: 11),
-                    .foregroundColor: UIColor.gray
-                ]
-                let paragraphStyle = NSMutableParagraphStyle()
-                paragraphStyle.lineSpacing = 4
-                
-                let textAttrs: [NSAttributedString.Key: Any] = [
-                    .font: UIFont.systemFont(ofSize: 13),
-                    .paragraphStyle: paragraphStyle,
-                    .foregroundColor: UIColor.black
-                ]
-                
-                let dateString = Date().formatted(date: .long, time: .shortened)
-                
-                context.beginPage()
-                
-                // Header
-                (title as NSString).draw(in: CGRect(x: margin, y: 50, width: textWidth, height: 30), withAttributes: titleAttrs)
-                if let subtitle = subtitle {
-                    (subtitle as NSString).draw(in: CGRect(x: margin, y: 80, width: textWidth, height: 20), withAttributes: subtitleAttrs)
-                }
-                (dateString as NSString).draw(in: CGRect(x: margin, y: 105, width: textWidth, height: 20), withAttributes: dateAttrs)
-                
-                // Divider
-                UIColor.lightGray.setFill()
-                UIRectFill(CGRect(x: margin, y: 130, width: textWidth, height: 1))
-                
-                // Content
-                let contentRect = CGRect(x: margin, y: 150, width: textWidth, height: pageHeight - 200)
-                (text as NSString).draw(in: contentRect, withAttributes: textAttrs)
-                
-                // Footer
-                let footer = "Generated by Voice Notes"
-                let footerStyle = NSMutableParagraphStyle()
-                footerStyle.alignment = .center
-                (footer as NSString).draw(in: CGRect(x: 0, y: pageHeight - 40, width: pageWidth, height: 20), withAttributes: [
-                    .font: UIFont.systemFont(ofSize: 11),
-                    .foregroundColor: UIColor.gray,
-                    .paragraphStyle: footerStyle
-                ])
-            }
-            
-            print("✅ PDF generated at \(url)")
-            return url
-            
-        } catch {
-            print("❌ Failed to generate PDF: \(error.localizedDescription)")
-            return nil
-        }
+        .buttonStyle(.plain)
     }
 }
 
-// MARK: - Share Item
+// MARK: - Record View
 
-struct ShareItem: Identifiable {
-    let id = UUID()
-    let items: [Any]
-}
+struct RecordView: View {
+    @ObservedObject var recorder: RecordingManager
+    @State private var elapsed: TimeInterval = 0
+    @State private var timer: Timer?
+    @State private var pulse = false
 
-// MARK: - Activity View Controller
-
-struct ActivityViewController: UIViewControllerRepresentable {
-    let activityItems: [Any]
-    
-    func makeUIViewController(context: Context) -> UIActivityViewController {
-        let controller = UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
-        return controller
-    }
-    
-    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
-}
-
-// MARK: - Advanced Text Editor
-
-struct AdvancedTextEditorView: View {
-    @Binding var text: String
-    @Binding var isShowing: Bool
-    let onSave: () -> Void
-    
-    @State private var undoStack: [String] = []
-    @State private var redoStack: [String] = []
-    @State private var fontSize: CGFloat = 17
-    @State private var showStats = true
-    @State private var textSelection: NSRange = NSRange(location: 0, length: 0)
-    @FocusState private var isEditorFocused: Bool
-    
     var body: some View {
         VStack(spacing: 0) {
             // Header
-            HStack {
-                Button(action: {
-                    withAnimation(.spring()) {
-                        isShowing = false
-                    }
-                }) {
-                    HStack(spacing: 6) {
-                        Image(systemName: "chevron.down")
-                        Text("Done")
-                    }
-                    .font(.system(size: 17, weight: .medium))
-                    .foregroundColor(.blue)
-                }
-                
-                Spacer()
-                
-                Text("Editor")
-                    .font(.headline)
-                
-                Spacer()
-                
-                Button(action: {
-                    onSave()
-                    withAnimation(.spring()) {
-                        isShowing = false
-                    }
-                }) {
-                    Text("Save")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundColor(.blue)
-                }
+            header
+
+            // Content
+            if recorder.segments.isEmpty && !recorder.isRecording {
+                idleState
+            } else {
+                liveTranscript
             }
-            .padding()
-            .background(Color(.systemBackground))
-            .shadow(color: .black.opacity(0.05), radius: 3, y: 2)
-            
-            // Formatting Toolbar
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
-                    // Undo/Redo
-                    Group {
-                        Button(action: undo) {
-                            Image(systemName: "arrow.uturn.backward")
-                                .foregroundColor(undoStack.isEmpty ? .gray : .blue)
-                        }
-                        .disabled(undoStack.isEmpty)
-                        
-                        Button(action: redo) {
-                            Image(systemName: "arrow.uturn.forward")
-                                .foregroundColor(redoStack.isEmpty ? .gray : .blue)
-                        }
-                        .disabled(redoStack.isEmpty)
-                    }
-                    .font(.system(size: 20))
-                    .padding(.horizontal, 8)
-                    
-                    Divider().frame(height: 30)
-                    
-                    // Font Size
-                    HStack(spacing: 8) {
-                        Button(action: { adjustFontSize(-1) }) {
-                            Image(systemName: "minus.circle")
-                                .foregroundColor(.blue)
-                        }
-                        
-                        Text("\(Int(fontSize))pt")
-                            .font(.system(size: 14, weight: .medium))
-                            .foregroundColor(.primary)
-                            .frame(width: 40)
-                        
-                        Button(action: { adjustFontSize(1) }) {
-                            Image(systemName: "plus.circle")
-                                .foregroundColor(.blue)
-                        }
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    .background(Color(.systemGray6))
-                    .cornerRadius(10)
-                    
-                    Divider().frame(height: 30)
-                    
-                    // Text Formatting
-                    FormatButton(icon: "list.bullet", label: "List") {
-                        addPrefix("• ")
-                    }
-                    
-                    FormatButton(icon: "textformat.abc", label: "Lower") {
-                        transformText { $0.lowercased() }
-                    }
-                    
-                    FormatButton(icon: "textformat.abc.dottedunderline", label: "Upper") {
-                        transformText { $0.uppercased() }
-                    }
-                    
-                    FormatButton(icon: "textformat.alt", label: "Title") {
-                        transformText { $0.capitalized }
-                    }
-                }
-                .padding(.horizontal)
-            }
-            .padding(.vertical, 12)
-            .background(Color(.systemBackground))
-            .shadow(color: .black.opacity(0.05), radius: 3, y: 2)
-            
-            // Text Editor
-            TextEditor(text: $text)
-                .font(.system(size: fontSize))
-                .padding()
-                .focused($isEditorFocused)
-                .onChange(of: text) { newValue in
-                    if !newValue.isEmpty && (undoStack.isEmpty || undoStack.last != newValue) {
-                        saveToUndoStack()
-                    }
-                }
-            
-            // Stats Bar
-            if showStats {
-                HStack(spacing: 20) {
-                    StatLabel(icon: "text.word.spacing", value: "\(wordCount)", label: "words")
-                    StatLabel(icon: "character", value: "\(characterCount)", label: "chars")
-                    StatLabel(icon: "text.alignleft", value: "\(lineCount)", label: "lines")
-                    
-                    Spacer()
-                    
-                    Button(action: {
-                        withAnimation {
-                            showStats.toggle()
-                        }
-                    }) {
-                        Image(systemName: "chevron.down")
-                            .font(.caption)
-                            .foregroundColor(.gray)
-                    }
-                }
-                .padding(.horizontal)
-                .padding(.vertical, 12)
-                .background(Color(.systemGray6))
-            }
+
+            Spacer(minLength: 0)
+
+            // Controls
+            controls
+                .padding(.bottom, 90) // above tab bar
         }
-        .background(Color(.systemBackground))
-        .onAppear {
-            isEditorFocused = true
-            undoStack = []
-            redoStack = []
+        .alert("Error", isPresented: Binding(
+            get: { recorder.errorMessage != nil },
+            set: { if !$0 { recorder.errorMessage = nil } }
+        )) { Button("OK") {} } message: {
+            Text(recorder.errorMessage ?? "")
         }
     }
-    
-    // MARK: - Stats
-    
+
+    // MARK: Header
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text("VOICE")
+                .font(.serif(28, weight: .regular))
+                .foregroundColor(.ink)
+            Spacer()
+            if recorder.isRecording {
+                HStack(spacing: 6) {
+                    Circle()
+                        .fill(Color.accent)
+                        .frame(width: 7, height: 7)
+                        .scaleEffect(pulse ? 1.3 : 1.0)
+                        .animation(.easeInOut(duration: 0.6).repeatForever(autoreverses: true), value: pulse)
+                        .onAppear { pulse = true }
+                        .onDisappear { pulse = false }
+                    Text(formatTime(elapsed))
+                        .font(.mono(14))
+                        .foregroundColor(.accent)
+                }
+            }
+        }
+        .padding(.horizontal, 28)
+        .padding(.top, 58)
+        .padding(.bottom, 24)
+    }
+
+    // MARK: Idle State
+    private var idleState: some View {
+        VStack(spacing: 0) {
+            Spacer()
+            Text("Tap to begin")
+                .font(.serif(17))
+                .foregroundColor(.fog)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: Live Transcript
+    private var liveTranscript: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    ForEach(recorder.segments) { seg in
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(formatTime(seg.timestamp))
+                                .font(.mono(10))
+                                .foregroundColor(.fog)
+                                .tracking(1)
+                            Text(seg.text.isEmpty ? "…" : seg.text)
+                                .font(.serif(17))
+                                .foregroundColor(seg.text.isEmpty ? .fog : .ink)
+                                .lineSpacing(5)
+                                .id(seg.id)
+                        }
+                    }
+                }
+                .padding(.horizontal, 28)
+                .padding(.bottom, 40)
+            }
+            .onChange(of: recorder.segments.last?.text) { _ in
+                if let last = recorder.segments.last {
+                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                }
+            }
+        }
+    }
+
+    // MARK: Controls
+    private var controls: some View {
+        VStack(spacing: 24) {
+            // Divider line
+            Rectangle()
+                .fill(Color.inkLight.opacity(0.3))
+                .frame(height: 1)
+                .padding(.horizontal, 28)
+
+            HStack(spacing: 48) {
+                // Pause / empty
+                if recorder.isRecording {
+                    Button(action: recorder.togglePause) {
+                        Image(systemName: recorder.isPaused ? "play" : "pause")
+                            .font(.system(size: 20, weight: .light))
+                            .foregroundColor(.inkMid)
+                            .frame(width: 44, height: 44)
+                    }
+                } else {
+                    // Save button (only after stopped with content)
+                    if !recorder.segments.isEmpty {
+                        Button(action: { recorder.save(duration: elapsed); stopTimer() }) {
+                            HStack(spacing: 6) {
+                                Image(systemName: "arrow.down.to.line")
+                                    .font(.system(size: 14, weight: .regular))
+                                Text("SAVE")
+                                    .font(.mono(11, weight: .medium))
+                                    .tracking(2)
+                            }
+                            .foregroundColor(.ink)
+                            .frame(width: 88, height: 44)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(Color.inkMid, lineWidth: 1)
+                            )
+                        }
+                    } else {
+                        Color.clear.frame(width: 44, height: 44)
+                    }
+                }
+
+                // Main record button
+                Button(action: handleMainButton) {
+                    ZStack {
+                        Circle()
+                            .fill(recorder.isRecording ? Color.accent : Color.ink)
+                            .frame(width: 68, height: 68)
+
+                        if recorder.isRecording {
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(Color.paper)
+                                .frame(width: 22, height: 22)
+                        } else {
+                            Circle()
+                                .fill(Color.paper)
+                                .frame(width: 20, height: 20)
+                        }
+                    }
+                }
+                .buttonStyle(.plain)
+                .scaleEffect(recorder.isRecording ? 1.05 : 1.0)
+                .animation(.spring(response: 0.3, dampingFraction: 0.6), value: recorder.isRecording)
+
+                // Discard
+                if !recorder.segments.isEmpty && !recorder.isRecording {
+                    Button(action: { recorder.discard(); elapsed = 0 }) {
+                        Image(systemName: "trash")
+                            .font(.system(size: 18, weight: .light))
+                            .foregroundColor(.fog)
+                            .frame(width: 44, height: 44)
+                    }
+                } else {
+                    Color.clear.frame(width: 44, height: 44)
+                }
+            }
+            .padding(.bottom, 8)
+
+            // Word count
+            if !recorder.segments.isEmpty {
+                Text("\(wordCount) words")
+                    .font(.mono(11))
+                    .foregroundColor(.fog)
+                    .tracking(0.5)
+            }
+        }
+    }
+
+    // MARK: Helpers
     private var wordCount: Int {
-        text.split { $0 == " " || $0.isNewline }.count
+        recorder.segments.reduce(0) { $0 + $1.text.split { $0.isWhitespace }.count }
     }
-    
-    private var characterCount: Int {
-        text.count
-    }
-    
-    private var lineCount: Int {
-        text.components(separatedBy: .newlines).count
-    }
-    
-    // MARK: - Helper Methods
-    
-    private func saveToUndoStack() {
-        undoStack.append(text)
-        redoStack.removeAll()
-        if undoStack.count > 50 {
-            undoStack.removeFirst()
-        }
-    }
-    
-    private func undo() {
-        guard !undoStack.isEmpty else { return }
-        redoStack.append(text)
-        text = undoStack.removeLast()
-    }
-    
-    private func redo() {
-        guard !redoStack.isEmpty else { return }
-        undoStack.append(text)
-        text = redoStack.removeLast()
-    }
-    
-    private func adjustFontSize(_ delta: CGFloat) {
-        fontSize = max(12, min(32, fontSize + delta))
-    }
-    
-    private func addPrefix(_ prefix: String) {
-        saveToUndoStack()
-        let lines = text.components(separatedBy: .newlines)
-        text = lines.map { prefix + $0 }.joined(separator: "\n")
-    }
-    
-    private func transformText(_ transform: (String) -> String) {
-        saveToUndoStack()
-        text = transform(text)
-    }
-}
 
-struct FormatButton: View {
-    let icon: String
-    let label: String
-    let action: () -> Void
-    
-    var body: some View {
-        Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: icon)
-                    .font(.system(size: 18))
-                Text(label)
-                    .font(.system(size: 10))
-            }
-            .foregroundColor(.blue)
-            .frame(width: 60, height: 50)
-            .background(Color(.systemGray6))
-            .cornerRadius(10)
+    private func handleMainButton() {
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        if recorder.isRecording {
+            recorder.stop()
+            stopTimer()
+        } else {
+            elapsed = 0
+            recorder.discard()
+            recorder.toggleRecording()
+            startTimer()
         }
     }
-}
 
-struct StatLabel: View {
-    let icon: String
-    let value: String
-    let label: String
-    
-    var body: some View {
-        HStack(spacing: 4) {
-            Image(systemName: icon)
-                .font(.caption)
-            Text(value)
-                .font(.system(size: 14, weight: .semibold))
-            Text(label)
-                .font(.caption)
-                .foregroundColor(.gray)
+    private func startTimer() {
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { _ in
+            if !recorder.isPaused { elapsed += 0.5 }
         }
+    }
+
+    private func stopTimer() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    private func formatTime(_ t: TimeInterval) -> String {
+        let m = Int(t) / 60, s = Int(t) % 60
+        return String(format: "%02d:%02d", m, s)
     }
 }
 
 // MARK: - History View
 
 struct HistoryView: View {
-    @Binding var isShowing: Bool
-    @Binding var transcriptions: [Transcription]
-    let onSelect: (Transcription) -> Void
-    let onDelete: (Transcription) -> Void
-    let onToggleFavorite: (Transcription) -> Void
-    
-    @State private var filterFavorites = false
-    @State private var searchQuery = ""
-    
-    var filteredTranscriptions: [Transcription] {
-        var result = transcriptions
-        
-        if filterFavorites {
-            result = result.filter { $0.isFavorite }
-        }
-        
-        if !searchQuery.isEmpty {
-            result = result.filter { $0.text.localizedCaseInsensitiveContains(searchQuery) || $0.title.localizedCaseInsensitiveContains(searchQuery) }
-        }
-        
-        return result.sorted { $0.date > $1.date }
-    }
-    
-    var body: some View {
-        HStack(spacing: 0) {
-            // Dimmed background
-            Color.black.opacity(0.3)
-                .ignoresSafeArea()
-                .onTapGesture {
-                    withAnimation(.spring()) {
-                        isShowing = false
-                    }
-                }
-            
-            // Sidebar
-            VStack(spacing: 0) {
-                // Header
-                HStack {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("History")
-                            .font(.system(size: 26, weight: .bold))
-                        Text("\(transcriptions.count) notes")
-                            .font(.caption)
-                            .foregroundColor(.gray)
-                    }
-                    
-                    Spacer()
-                    
-                    Button(action: {
-                        withAnimation(.spring()) {
-                            isShowing = false
-                        }
-                    }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 28))
-                            .foregroundColor(.gray)
-                    }
-                }
-                .padding()
-                
-                // Search & Filter
-                VStack(spacing: 12) {
-                    HStack {
-                        Image(systemName: "magnifyingglass")
-                            .foregroundColor(.gray)
-                        TextField("Search notes...", text: $searchQuery)
-                            .textFieldStyle(.plain)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 10)
-                    .background(Color(.systemGray6))
-                    .cornerRadius(10)
-                    
-                    Button(action: {
-                        withAnimation {
-                            filterFavorites.toggle()
-                        }
-                    }) {
-                        HStack {
-                            Image(systemName: filterFavorites ? "star.fill" : "star")
-                            Text(filterFavorites ? "All Notes" : "Favorites Only")
-                                .font(.subheadline)
-                        }
-                        .foregroundColor(filterFavorites ? .yellow : .blue)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(filterFavorites ? Color.yellow.opacity(0.2) : Color.blue.opacity(0.1))
-                        .cornerRadius(8)
-                    }
-                }
-                .padding(.horizontal)
-                
-                Divider()
-                    .padding(.vertical, 8)
-                
-                // List
-                if filteredTranscriptions.isEmpty {
-                    VStack(spacing: 16) {
-                        Image(systemName: filterFavorites ? "star.slash" : "tray")
-                            .font(.system(size: 56))
-                            .foregroundColor(.gray.opacity(0.3))
-                        
-                        Text(filterFavorites ? "No favorites yet" : "No notes yet")
-                            .font(.headline)
-                            .foregroundColor(.gray)
-                        
-                        Text(filterFavorites ? "Star notes to save them here" : "Your transcriptions will appear here")
-                            .font(.subheadline)
-                            .foregroundColor(.gray.opacity(0.7))
-                            .multilineTextAlignment(.center)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .padding()
-                } else {
-                    ScrollView {
-                        LazyVStack(spacing: 12) {
-                            ForEach(filteredTranscriptions) { transcription in
-                                HistoryItemCard(
-                                    transcription: transcription,
-                                    onSelect: {
-                                        onSelect(transcription)
-                                        withAnimation(.spring()) {
-                                            isShowing = false
-                                        }
-                                    },
-                                    onDelete: {
-                                        withAnimation {
-                                            onDelete(transcription)
-                                        }
-                                    },
-                                    onToggleFavorite: {
-                                        onToggleFavorite(transcription)
-                                    }
-                                )
-                            }
-                        }
-                        .padding(.horizontal)
-                        .padding(.bottom, 20)
-                    }
-                }
-            }
-            .frame(width: UIScreen.main.bounds.width * 0.85)
-            .background(Color(.systemBackground))
-        }
-    }
-}
+    @ObservedObject var recorder: RecordingManager
+    @State private var selectedMeeting: Meeting?
+    @State private var shareItems: [Any]?
 
-struct HistoryItemCard: View {
-    let transcription: Transcription
-    let onSelect: () -> Void
-    let onDelete: () -> Void
-    let onToggleFavorite: () -> Void
-    
-    @State private var showFullText = false
-    @State private var showDeleteAlert = false
-    
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(spacing: 0) {
             // Header
             HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(transcription.title)
-                        .font(.system(size: 16, weight: .semibold))
-                        .lineLimit(1)
-                    
-                    Text(transcription.date.formatted(date: .abbreviated, time: .shortened))
-                        .font(.caption)
-                        .foregroundColor(.gray)
-                }
-                
+                Text("NOTES")
+                    .font(.serif(28, weight: .regular))
+                    .foregroundColor(.ink)
                 Spacer()
-                
-                Button(action: onToggleFavorite) {
-                    Image(systemName: transcription.isFavorite ? "star.fill" : "star")
-                        .font(.system(size: 20))
-                        .foregroundColor(transcription.isFavorite ? .yellow : .gray)
-                }
+                Text("\(recorder.history.count)")
+                    .font(.mono(13))
+                    .foregroundColor(.fog)
             }
-            
-            // Content Preview
-            Text(transcription.text)
-                .font(.system(size: 14))
-                .lineLimit(showFullText ? nil : 3)
-                .foregroundColor(.primary)
-            
-            // Tags
-            if !transcription.tags.isEmpty {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 6) {
-                        ForEach(transcription.tags, id: \.self) { tag in
-                            Text(tag)
-                                .font(.caption2)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.blue.opacity(0.1))
-                                .foregroundColor(.blue)
-                                .cornerRadius(6)
-                        }
-                    }
-                }
-            }
-            
-            // Footer
-            HStack {
-                HStack(spacing: 4) {
-                    Image(systemName: "text.word.spacing")
-                        .font(.caption2)
-                    Text("\(transcription.text.split { $0 == " " || $0.isNewline }.count)")
-                        .font(.caption)
-                }
-                .foregroundColor(.gray)
-                
+            .padding(.horizontal, 28)
+            .padding(.top, 58)
+            .padding(.bottom, 24)
+
+            if recorder.history.isEmpty {
                 Spacer()
-                
-                HStack(spacing: 16) {
-                    Button(action: {
-                        withAnimation {
-                            showFullText.toggle()
-                        }
-                    }) {
-                        Text(showFullText ? "Less" : "More")
-                            .font(.caption)
-                            .foregroundColor(.blue)
-                    }
-                    
-                    Button(action: onSelect) {
-                        HStack(spacing: 4) {
-                            Image(systemName: "arrow.right.circle.fill")
-                            Text("Use")
-                        }
-                        .font(.caption)
-                        .fontWeight(.medium)
-                        .foregroundColor(.blue)
-                    }
-                    
-                    Button(action: { showDeleteAlert = true }) {
-                        Image(systemName: "trash")
-                            .font(.caption)
-                            .foregroundColor(.red)
+                Text("No recordings yet")
+                    .font(.serif(17))
+                    .foregroundColor(.fog)
+                Spacer()
+            } else {
+                List {
+                    ForEach(recorder.history) { meeting in
+                        MeetingRow(meeting: meeting)
+                            .listRowBackground(Color.paper)
+                            .listRowSeparatorTint(Color.inkLight.opacity(0.3))
+                            .listRowInsets(EdgeInsets(top: 0, leading: 28, bottom: 0, trailing: 28))
+                            .onTapGesture { selectedMeeting = meeting }
+                            .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                Button(role: .destructive) {
+                                    recorder.delete(meeting)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
+                            .swipeActions(edge: .leading) {
+                                Button {
+                                    shareItems = [meeting.transcript]
+                                } label: {
+                                    Label("Share", systemImage: "square.and.arrow.up")
+                                }
+                                .tint(Color.inkMid)
+                            }
                     }
                 }
+                .listStyle(.plain)
+                .background(Color.paper)
             }
+
+            Spacer(minLength: 0)
+                .frame(height: 90)
         }
-        .padding(16)
-        .background(Color(.systemGray6))
-        .cornerRadius(16)
-        .alert("Delete Note", isPresented: $showDeleteAlert) {
-            Button("Cancel", role: .cancel) { }
-            Button("Delete", role: .destructive) {
-                onDelete()
+        .sheet(item: $selectedMeeting) { meeting in
+            MeetingDetailView(meeting: meeting)
+        }
+        .sheet(isPresented: Binding(get: { shareItems != nil }, set: { if !$0 { shareItems = nil } })) {
+            if let items = shareItems {
+                ActivityVC(items: items)
             }
-        } message: {
-            Text("Are you sure you want to delete this transcription?")
         }
     }
 }
 
-// MARK: - Action Button
+// MARK: - Meeting Row
 
-struct ActionButton: View {
-    let icon: String
-    let title: String
-    let color: Color
-    let action: () -> Void
-    
-    @State private var isPressed = false
-    @Environment(\.isEnabled) private var isEnabled
-    
+struct MeetingRow: View {
+    let meeting: Meeting
+
     var body: some View {
-        Button(action: action) {
-            VStack(spacing: 6) {
-                Image(systemName: icon)
-                    .font(.system(size: 22))
-                Text(title)
-                    .font(.system(size: 12, weight: .medium))
-            }
-            .foregroundColor(isEnabled ? color : .gray)
-            .frame(width: 80, height: 70)
-            .background(isEnabled ? color.opacity(0.12) : Color(.systemGray6))
-            .cornerRadius(14)
-            .scaleEffect(isPressed ? 0.92 : 1.0)
-            .opacity(isEnabled ? 1.0 : 0.5)
-        }
-        .pressEvents {
-            if isEnabled {
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
-                    isPressed = true
-                }
-            }
-        } onRelease: {
-            withAnimation(.spring(response: 0.3, dampingFraction: 0.6)) {
-                isPressed = false
+        VStack(alignment: .leading, spacing: 6) {
+            Text(meeting.title)
+                .font(.serif(16))
+                .foregroundColor(.ink)
+                .lineLimit(1)
+
+            HStack(spacing: 12) {
+                Text(formatDur(meeting.duration))
+                    .font(.mono(11))
+                    .foregroundColor(.fog)
+                Text("·")
+                    .foregroundColor(.fog)
+                    .font(.mono(11))
+                Text(wordCount(meeting.transcript))
+                    .font(.mono(11))
+                    .foregroundColor(.fog)
             }
         }
+        .padding(.vertical, 16)
+    }
+
+    private func formatDur(_ t: TimeInterval) -> String {
+        let m = Int(t) / 60, s = Int(t) % 60
+        return String(format: "%d:%02d", m, s)
+    }
+
+    private func wordCount(_ text: String) -> String {
+        let n = text.split { $0.isWhitespace }.count
+        return "\(n) words"
     }
 }
 
-// MARK: - Press Events Modifier
+// MARK: - Meeting Detail
 
-extension View {
-    func pressEvents(onPress: @escaping () -> Void, onRelease: @escaping () -> Void) -> some View {
-        modifier(PressEventModifier(onPress: onPress, onRelease: onRelease))
-    }
-}
+struct MeetingDetailView: View {
+    let meeting: Meeting
+    @Environment(\.dismiss) var dismiss
+    @State private var shareItems: [Any]?
 
-struct PressEventModifier: ViewModifier {
-    let onPress: () -> Void
-    let onRelease: () -> Void
-    
-    func body(content: Content) -> some View {
-        content
-            .simultaneousGesture(
-                DragGesture(minimumDistance: 0)
-                    .onChanged { _ in onPress() }
-                    .onEnded { _ in onRelease() }
-            )
-    }
-}
-
-// MARK: - Speech Recognition Manager
-
-final class SpeechRecognitionManager: ObservableObject {
-    @Published var isRecording = false
-    @Published var transcribedText = ""
-    @Published var showAlert = false
-    @Published var alertMessage = ""
-    @Published var transcriptionHistory: [Transcription] = []
-
-    private let audioEngine = AVAudioEngine()
-    private var speechRecognizer: SFSpeechRecognizer?
-    private var recognitionRequest: SFSpeechAudioBufferRecognitionRequest?
-    private var recognitionTask: SFSpeechRecognitionTask?
-    private var recordingTimeoutTimer: Timer?
-    private var isUserInitiatedStop = false
-    private var audioSessionConfigured = false
-
-    // MARK: - Init
-    
-    init(locale: String = "en-US") {
-        self.speechRecognizer = SFSpeechRecognizer(locale: Locale(identifier: locale))
-        
-        guard let recognizer = speechRecognizer, recognizer.isAvailable else {
-            DispatchQueue.main.async {
-                self.showAlert(message: "Speech recognition is not supported on this device.")
-            }
-            return
-        }
-        
-        requestPermissions()
-        loadHistory()
-    }
-    
-    deinit {
-        cleanup()
-    }
-    
-    // MARK: - Permissions
-    
-    func requestPermissions() {
-        SFSpeechRecognizer.requestAuthorization { authStatus in
-            DispatchQueue.main.async {
-                switch authStatus {
-                case .authorized:
-                    break
-                case .denied:
-                    self.showAlert(message: "Speech recognition access denied. Please enable it in Settings.")
-                case .restricted:
-                    self.showAlert(message: "Speech recognition is restricted on this device.")
-                case .notDetermined:
-                    break
-                @unknown default:
-                    break
-                }
-            }
-        }
-
-        AVAudioSession.sharedInstance().requestRecordPermission { granted in
-            DispatchQueue.main.async {
-                if !granted {
-                    self.showAlert(message: "Microphone access denied. Please enable it in Settings.")
-                }
-            }
-        }
-    }
-
-    // MARK: - Recording Control
-    
-    func toggleRecording() {
-        if isRecording {
-            stopRecording()
-        } else {
-            startRecording()
-        }
-    }
-
-    private func startRecording() {
-        guard let recognizer = speechRecognizer, recognizer.isAvailable else {
-            showAlert(message: "Speech recognition service is currently unavailable.")
-            return
-        }
-        
-        // Check permissions before starting
-        let authStatus = SFSpeechRecognizer.authorizationStatus()
-        guard authStatus == .authorized else {
-            showAlert(message: "Please enable speech recognition in Settings.")
-            return
-        }
-
-        let generator = UINotificationFeedbackGenerator()
-        generator.notificationOccurred(.success)
-
-        do {
-            try configureAudioSession()
-            resetRecognition()
-            
-            recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
-            guard let recognitionRequest = recognitionRequest else {
-                showAlert(message: "Unable to start recognition request.")
-                return
-            }
-
-            recognitionRequest.shouldReportPartialResults = true
-            
-            // Add timeout for request
-            if #available(iOS 13, *) {
-                recognitionRequest.requiresOnDeviceRecognition = false
-            }
-
-            let inputNode = audioEngine.inputNode
-            let recordingFormat = inputNode.outputFormat(forBus: 0)
-            
-            // Ensure previous taps are removed
-            inputNode.removeTap(onBus: 0)
-            
-            inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
-                self?.recognitionRequest?.append(buffer)
-            }
-
-            recognitionTask = recognizer.recognitionTask(with: recognitionRequest) { [weak self] result, error in
-                guard let self = self else { return }
-                
-                var isFinal = false
-                
-                if let result = result {
-                    DispatchQueue.main.async {
-                        self.transcribedText = result.bestTranscription.formattedString
+    var body: some View {
+        NavigationView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 32) {
+                    // Meta
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(meeting.date, style: .date)
+                            .font(.mono(12))
+                            .foregroundColor(.fog)
+                            .tracking(1)
+                        Text(meeting.title)
+                            .font(.serif(26, weight: .regular))
+                            .foregroundColor(.ink)
                     }
-                    isFinal = result.isFinal
-                    self.resetTimeoutTimer()
-                }
 
-                if error != nil || isFinal {
-                    DispatchQueue.main.async {
-                        if !self.isUserInitiatedStop && error != nil {
-                            // Only show error if it's not a user-initiated stop
-                            if let nsError = error as NSError?, nsError.code != 216 { // 216 is cancelled
-                                self.handleRecognitionError(error!)
+                    Divider().overlay(Color.inkLight.opacity(0.3))
+
+                    // Segments or plain transcript
+                    if meeting.segments.isEmpty {
+                        Text(meeting.transcript)
+                            .font(.serif(17))
+                            .foregroundColor(.ink)
+                            .lineSpacing(6)
+                    } else {
+                        ForEach(meeting.segments) { seg in
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(formatTS(seg.timestamp))
+                                    .font(.mono(10))
+                                    .foregroundColor(.fog)
+                                    .tracking(1)
+                                Text(seg.text)
+                                    .font(.serif(17))
+                                    .foregroundColor(.ink)
+                                    .lineSpacing(5)
                             }
                         }
                     }
                 }
+                .padding(.horizontal, 28)
+                .padding(.top, 24)
+                .padding(.bottom, 60)
             }
+            .background(Color.paper)
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Close") { dismiss() }
+                        .font(.serif(16))
+                        .foregroundColor(.ink)
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Menu {
+                        Button {
+                            shareItems = [meeting.transcript]
+                        } label: {
+                            Label("Share as Text", systemImage: "doc.plaintext")
+                        }
 
-            audioEngine.prepare()
-            try audioEngine.start()
-            isRecording = true
-            audioSessionConfigured = true
-            resetTimeoutTimer()
-
-        } catch {
-            handleAudioSessionError(error)
-        }
-    }
-
-    private func stopRecording(save: Bool = true) {
-        recordingTimeoutTimer?.invalidate()
-        recordingTimeoutTimer = nil
-        
-        let generator = UINotificationFeedbackGenerator()
-        generator.notificationOccurred(.warning)
-        
-        // Set flag BEFORE canceling to prevent error alert
-        isUserInitiatedStop = true
-        
-        // Stop audio engine safely
-        if audioEngine.isRunning {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
-        }
-        
-        // Tell the recognition request that no more audio will come
-        recognitionRequest?.endAudio()
-        
-        // ❌ DO NOT cancel recognitionTask — this clears partial text
-        // recognitionTask?.cancel()  ← remove this line entirely
-
-        // ✅ Instead, finish gracefully and keep the last recognized text
-        recognitionTask = nil
-        recognitionRequest = nil
-        
-        // Deactivate audio session
-        if audioSessionConfigured {
-            do {
-                try AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
-                audioSessionConfigured = false
-            } catch {
-                print("Failed to deactivate audio session: \(error)")
+                        Button {
+                            if let pdfURL = TranscriptPDFMaker.make(from: meeting) {
+                                shareItems = [pdfURL]
+                            }
+                        } label: {
+                            Label("Export as PDF", systemImage: "doc.richtext")
+                        }
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
+                            .font(.system(size: 16, weight: .light))
+                            .foregroundColor(.ink)
+                    }
+                }
             }
         }
-        
-        isRecording = false
-        
-        // Reset flag after short delay
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            self.isUserInitiatedStop = false
-        }
-    }
-
-    
-    private func cleanup() {
-        recordingTimeoutTimer?.invalidate()
-        if audioEngine.isRunning {
-            audioEngine.stop()
-            audioEngine.inputNode.removeTap(onBus: 0)
-        }
-        recognitionTask?.cancel()
-        recognitionRequest = nil
-        recognitionTask = nil
-        
-        if audioSessionConfigured {
-            try? AVAudioSession.sharedInstance().setActive(false)
-            audioSessionConfigured = false
-        }
-    }
-
-    // MARK: - Public Methods
-    
-    func saveCurrentTranscription() {
-        guard !transcribedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-        let transcription = Transcription(text: transcribedText, date: Date())
-        transcriptionHistory.append(transcription)
-        saveHistory()
-    }
-    
-    func toggleFavorite(_ transcription: Transcription) {
-        if let index = transcriptionHistory.firstIndex(where: { $0.id == transcription.id }) {
-            transcriptionHistory[index].isFavorite.toggle()
-            saveHistory()
-        }
-    }
-
-    // MARK: - Helpers
-    
-    private func configureAudioSession() throws {
-        let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.record, mode: .measurement, options: [.duckOthers])
-        try session.setActive(true, options: .notifyOthersOnDeactivation)
-    }
-
-    private func resetRecognition() {
-        recognitionTask?.cancel()
-        recognitionTask = nil
-        recognitionRequest = nil
-    }
-
-    private func resetTimeoutTimer() {
-        recordingTimeoutTimer?.invalidate()
-        recordingTimeoutTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: false) { [weak self] _ in
-            guard let self = self else { return }
-            DispatchQueue.main.async {
-                guard !self.isUserInitiatedStop else { return }
-                self.showAlert(message: "Recording stopped due to inactivity.")
-                self.stopRecording(save: false)
+        .sheet(isPresented: Binding(get: { shareItems != nil }, set: { if !$0 { shareItems = nil } })) {
+            if let items = shareItems {
+                ActivityVC(items: items)
             }
         }
     }
 
-    private func handleRecognitionError(_ error: Error) {
-        guard !isUserInitiatedStop else {
-            isUserInitiatedStop = false
-            return
-        }
-
-        DispatchQueue.main.async {
-            let nsError = error as NSError
-            if nsError.code != 216 { // Ignore cancellation errors
-                self.showAlert(message: "Recognition error: \(error.localizedDescription)")
-            }
-            self.stopRecording(save: false)
-        }
+    private func formatTS(_ t: TimeInterval) -> String {
+        let m = Int(t) / 60, s = Int(t) % 60
+        return String(format: "%02d:%02d", m, s)
     }
+}
 
-    private func handleAudioSessionError(_ error: Error) {
-        DispatchQueue.main.async {
-            self.showAlert(message: "Audio session error: \(error.localizedDescription)")
-            self.isRecording = false
-        }
-    }
+// MARK: - PDF Generator
 
-    // MARK: - Persistence
-    
-    func saveHistory() {
+enum TranscriptPDFMaker {
+
+    static func make(from meeting: Meeting) -> URL? {
+        let pageSize   = CGRect(x: 0, y: 0, width: 595, height: 842) // A4 points
+        let margin: CGFloat = 56
+        let contentW   = pageSize.width - margin * 2
+
+        let renderer = UIGraphicsPDFRenderer(bounds: pageSize)
+
+        // Temp file
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(meeting.title.sanitized)_\(UUID().uuidString).pdf")
+
         do {
-            let data = try JSONEncoder().encode(transcriptionHistory)
-            UserDefaults.standard.set(data, forKey: "transcriptionHistory")
+            try renderer.writePDF(to: url) { ctx in
+                // ── Shared typography ──────────────────────────────────────
+                let titleFont    = UIFont(name: "Georgia", size: 22) ?? .systemFont(ofSize: 22, weight: .light)
+                let metaFont     = UIFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+                let bodyFont     = UIFont(name: "Georgia", size: 13) ?? .systemFont(ofSize: 13)
+                let tsFont       = UIFont.monospacedSystemFont(ofSize: 9, weight: .regular)
+                let speakerFont  = UIFont.monospacedSystemFont(ofSize: 9, weight: .medium)
+
+                let inkColor: UIColor  = UIColor(white: 0.06, alpha: 1)
+                let fogColor: UIColor  = UIColor(white: 0.55, alpha: 1)
+                let accentColor: UIColor = UIColor(red: 1.0, green: 0.36, blue: 0.22, alpha: 1)
+
+                var y: CGFloat = 0  // current vertical cursor
+
+                // ── Helper: start new page ─────────────────────────────────
+                func newPage() {
+                    ctx.beginPage()
+                    y = margin
+                }
+
+                // ── Helper: draw text, paginate automatically ──────────────
+                @discardableResult
+                func draw(_ string: String, font: UIFont, color: UIColor,
+                          indent: CGFloat = 0, spacing: CGFloat = 6) -> CGFloat {
+                    let attrs: [NSAttributedString.Key: Any] = [
+                        .font: font,
+                        .foregroundColor: color
+                    ]
+                    let avail = CGSize(width: contentW - indent, height: .greatestFiniteMagnitude)
+                    let bounds = (string as NSString).boundingRect(
+                        with: avail, options: .usesLineFragmentOrigin, attributes: attrs, context: nil)
+                    let h = ceil(bounds.height)
+
+                    if y + h > pageSize.height - margin {
+                        // Draw page number at bottom before flipping
+                        drawPageNumber(ctx, pageSize: pageSize, margin: margin,
+                                       font: metaFont, color: fogColor)
+                        newPage()
+                    }
+
+                    (string as NSString).draw(
+                        in: CGRect(x: margin + indent, y: y, width: contentW - indent, height: h),
+                        withAttributes: attrs)
+                    y += h + spacing
+                    return h
+                }
+
+                func drawPageNumber(_ ctx: UIGraphicsPDFRendererContext,
+                                    pageSize: CGRect, margin: CGFloat,
+                                    font: UIFont, color: UIColor) {
+                    // Page numbers aren't directly accessible from UIGraphicsPDFRenderer,
+                    // so we use a placeholder via context page count heuristic.
+                    // We skip this for simplicity — page numbers require tracking manually.
+                }
+
+                func drawRule(color: UIColor = UIColor(white: 0.85, alpha: 1)) {
+                    if y + 1 > pageSize.height - margin { newPage() }
+                    let path = UIBezierPath()
+                    path.move(to: CGPoint(x: margin, y: y))
+                    path.addLine(to: CGPoint(x: pageSize.width - margin, y: y))
+                    color.setStroke()
+                    path.lineWidth = 0.5
+                    path.stroke()
+                    y += 16
+                }
+
+                // ════════════════════════════════════════════════
+                // PAGE 1 — Title block
+                // ════════════════════════════════════════════════
+                newPage()
+
+                // Accent rule at top
+                let topBar = UIBezierPath(rect: CGRect(x: margin, y: margin - 12, width: 32, height: 2))
+                accentColor.setFill(); topBar.fill()
+                y = margin + 8
+
+                draw(meeting.title, font: titleFont, color: inkColor, spacing: 10)
+
+                // Date · duration · words
+                let df = DateFormatter(); df.dateStyle = .long; df.timeStyle = .short
+                let words = meeting.transcript.split { $0.isWhitespace }.count
+                let dur   = formatDuration(meeting.duration)
+                let meta  = "\(df.string(from: meeting.date))   ·   \(dur)   ·   \(words) words"
+                draw(meta, font: metaFont, color: fogColor, spacing: 20)
+
+                drawRule()
+
+                // ── Transcript body ───────────────────────────────────────
+                if meeting.segments.isEmpty {
+                    draw(meeting.transcript, font: bodyFont, color: inkColor, spacing: 0)
+                } else {
+                    for seg in meeting.segments {
+                        // Timestamp + speaker header
+                        let ts = formatTimestamp(seg.timestamp)
+                        let header = "\(ts)   \(seg.speaker.uppercased())"
+                        draw(header, font: speakerFont, color: fogColor, spacing: 4)
+                        draw(seg.text, font: bodyFont, color: inkColor, spacing: 18)
+                    }
+                }
+            }
+            return url
         } catch {
-            print("Error saving history: \(error)")
+            print("PDF render error: \(error)")
+            return nil
         }
     }
 
-    private func loadHistory() {
-        guard let data = UserDefaults.standard.data(forKey: "transcriptionHistory") else { return }
-        do {
-            transcriptionHistory = try JSONDecoder().decode([Transcription].self, from: data)
-        } catch {
-            print("Error loading history: \(error)")
-            transcriptionHistory = []
-        }
+    private static func formatDuration(_ t: TimeInterval) -> String {
+        let m = Int(t) / 60, s = Int(t) % 60
+        return String(format: "%d:%02d", m, s)
     }
 
-    private func showAlert(message: String) {
-        DispatchQueue.main.async {
-            self.alertMessage = message
-            self.showAlert = true
-        }
+    private static func formatTimestamp(_ t: TimeInterval) -> String {
+        let m = Int(t) / 60, s = Int(t) % 60
+        return String(format: "%02d:%02d", m, s)
     }
+}
+
+private extension String {
+    var sanitized: String {
+        self.components(separatedBy: CharacterSet.alphanumerics.union(.init(charactersIn: " -_")).inverted)
+            .joined()
+            .trimmingCharacters(in: .whitespaces)
+            .replacingOccurrences(of: " ", with: "_")
+    }
+}
+
+// MARK: - Activity View Controller
+
+struct ActivityVC: UIViewControllerRepresentable {
+    let items: [Any]
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
