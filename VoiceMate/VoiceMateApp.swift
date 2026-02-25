@@ -18,10 +18,10 @@ struct VoiceMateApp: App {
                   if hasCompletedOnboarding {
                       ContentView()
                          // .environmentObject(manager)
-                          .preferredColorScheme(.dark)
+                          .preferredColorScheme(.light)
                   } else {
                       OnboardingView(hasCompletedOnboarding: $hasCompletedOnboarding)
-                          .preferredColorScheme(.dark)
+                          .preferredColorScheme(.light)
                   }
               }
               // ✅ Correct place to run app launch logic

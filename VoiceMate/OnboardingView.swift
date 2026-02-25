@@ -1,331 +1,404 @@
 import SwiftUI
 import Speech
 import AVFoundation
+import UserNotifications
 
-// MARK: - Onboarding View - Minimalist Black & White
+// NOTE: This file relies on Color, Font extensions and the Haptics enum
+// defined in ContentView.swift (ink, fog, paper, accent, .mono(), .serif()).
+
+// MARK: - Onboarding View
 
 struct OnboardingView: View {
     @Binding var hasCompletedOnboarding: Bool
-    @State private var currentPage = 0
-    @State private var microphonePermissionGranted = false
-    @State private var speechPermissionGranted = false
+
+    @State private var page = 0
     @State private var primaryUseCase = ""
-    @State private var showingPermissionAlert = false
-    @State private var permissionAlertMessage = ""
-    
-    let useCases = ["Work", "Journal", "Meetings", "Writing", "Study", "Memos"]
-    
-    let features: [FeaturePage] = [
-        FeaturePage(
-            icon: "mic",
-            title: "Real-Time Transcription",
-            description: "Speak naturally and watch your words appear instantly."
-        ),
-        FeaturePage(
-            icon: "pencil",
-            title: "Smart Editor",
-            description: "Edit, format, and organize your transcripts with ease."
-        ),
-        FeaturePage(
-            icon: "clock",
-            title: "History & Search",
-            description: "All transcripts auto-saved. Find anything instantly."
-        ),
-        FeaturePage(
-            icon: "square.and.arrow.up",
-            title: "Export Anywhere",
-            description: "Share as text, PDF, or audio. Your notes, your way."
-        )
+    @State private var micGranted    = false
+    @State private var speechGranted = false
+    @State private var notifGranted  = false
+    @State private var showSettingsAlert   = false
+    @State private var settingsAlertMessage = ""
+
+    // Pages: 0 = welcome, 1 = use case, 2 = permissions, 3+ = features
+    private let features: [FeaturePage] = [
+        FeaturePage(icon: "waveform",             title: "Live Transcription",
+                    detail: "Speak naturally. Words appear as you talk."),
+        FeaturePage(icon: "clock",                title: "Auto-Saved Notes",
+                    detail: "Every recording is stored and searchable."),
+        FeaturePage(icon: "doc.richtext",         title: "Export as PDF",
+                    detail: "Share clean, formatted transcripts anywhere."),
+        FeaturePage(icon: "bell",                 title: "Smart Reminders",
+                    detail: "Daily nudges to keep capturing your thoughts."),
     ]
-    
+
     var body: some View {
         ZStack {
-            Color.white.ignoresSafeArea()
-            
-            switch currentPage {
-            case 0:
-                welcomeScreen
-            case 1:
-                questionsScreen
-            case 2:
-                permissionsScreen
-            default:
-                featuresCarousel
+            Color.paper.ignoresSafeArea()
+
+            switch page {
+            case 0: welcomeScreen
+            case 1: useCaseScreen
+            case 2: permissionsScreen
+            default: featuresScreen
             }
         }
-        .animation(.easeInOut(duration: 0.3), value: currentPage)
-        .alert("Permission Required", isPresented: $showingPermissionAlert) {
+        .animation(.easeInOut(duration: 0.25), value: page)
+        .alert("Permission Required", isPresented: $showSettingsAlert) {
             Button("Open Settings") {
                 if let url = URL(string: UIApplication.openSettingsURLString) {
                     UIApplication.shared.open(url)
                 }
             }
-            Button("Cancel", role: .cancel) { }
+            Button("Not now", role: .cancel) {}
         } message: {
-            Text(permissionAlertMessage)
+            Text(settingsAlertMessage)
         }
     }
-    
-    // MARK: - Welcome Screen
-    
+
+    // MARK: - Welcome
+
     private var welcomeScreen: some View {
-        VStack(spacing: 40) {
+        VStack(spacing: 0) {
             Spacer()
-            
-            Image(systemName: "mic")
-                .font(.system(size: 60))
-                .foregroundColor(.black)
-            
-            VStack(spacing: 12) {
-                Text("Voice Notes")
-                    .font(.system(size: 32, weight: .light))
-                    .kerning(2)
-                
-                Text("Your thoughts, captured")
-                    .font(.system(size: 16, weight: .light))
-                    .foregroundColor(.gray)
+
+            VStack(spacing: 20) {
+                // Accent mark
+                Rectangle()
+                    .fill(Color.accent)
+                    .frame(width: 32, height: 2)
+
+                Image(systemName: "mic")
+                    .font(.system(size: 52, weight: .ultraLight))
+                    .foregroundColor(.ink)
+
+                VStack(spacing: 8) {
+                    Text("Voice Notes")
+                        .font(.serif(32, weight: .regular))
+                        .foregroundColor(.ink)
+                        .kerning(1)
+
+                    Text("Your thoughts, captured")
+                        .font(.mono(13))
+                        .foregroundColor(.fog)
+                        .tracking(1)
+                }
             }
-            
+
             Spacer()
-            
-            Button(action: {
-                withAnimation { currentPage = 1 }
-            }) {
-                Text("Start")
-                    .font(.system(size: 16, weight: .medium))
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background(Color.black)
+
+            OnboardingButton(label: "Get started", style: .primary) {
+                Haptics.impact(.medium)
+                withAnimation { page = 1 }
             }
-            .padding(.horizontal, 30)
-            .padding(.bottom, 40)
+            .padding(.horizontal, 32)
+            .padding(.bottom, 52)
         }
     }
-    
-    // MARK: - Questions Screen
-    
-    private var questionsScreen: some View {
-        VStack(spacing: 30) {
-            HStack {
-                Button(action: { withAnimation { currentPage = 0 } }) {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 16))
-                        .foregroundColor(.black)
-                }
-                Spacer()
-                Text("1/3")
-                    .font(.system(size: 12, weight: .light))
-                    .foregroundColor(.gray)
-            }
-            .padding()
-            
+
+    // MARK: - Use Case
+
+    private var useCaseScreen: some View {
+        VStack(spacing: 0) {
+            stepHeader(back: { withAnimation { page = 0 } }, step: "1 / 3")
+
             Spacer()
-            
-            VStack(spacing: 24) {
-                Text("How will you use it?")
-                    .font(.system(size: 24, weight: .light))
-                    .kerning(1)
-                
-                Text("Select your primary use")
-                    .font(.system(size: 14))
-                    .foregroundColor(.gray)
-                
-                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
-                    ForEach(useCases, id: \.self) { useCase in
-                        Button(action: {
-                            withAnimation { primaryUseCase = useCase }
-                        }) {
-                            Text(useCase)
-                                .font(.system(size: 14, weight: .regular))
-                                .foregroundColor(primaryUseCase == useCase ? .white : .black)
-                                .padding(.vertical, 12)
-                                .frame(maxWidth: .infinity)
-                                .background(primaryUseCase == useCase ? Color.black : Color.clear)
-                                .overlay(Rectangle().stroke(Color.black, lineWidth: 1))
+
+            VStack(spacing: 28) {
+                VStack(spacing: 8) {
+                    Text("How will you use it?")
+                        .font(.serif(24, weight: .regular))
+                        .foregroundColor(.ink)
+
+                    Text("Select one to continue")
+                        .font(.mono(12))
+                        .foregroundColor(.fog)
+                        .tracking(1)
+                }
+
+                LazyVGrid(
+                    columns: [GridItem(.flexible()), GridItem(.flexible())],
+                    spacing: 10
+                ) {
+                    ForEach(useCases, id: \.self) { uc in
+                        UseCaseChip(label: uc, isSelected: primaryUseCase == uc) {
+                            Haptics.selection()
+                            withAnimation(.spring(response: 0.25)) { primaryUseCase = uc }
                         }
                     }
                 }
-                .padding(.horizontal, 30)
+                .padding(.horizontal, 32)
             }
-            
+
             Spacer()
-            
-            Button(action: { withAnimation { currentPage = 2 } }) {
-                Text("Continue")
-                    .font(.system(size: 14, weight: .regular))
-                    .foregroundColor(validateInputs() ? .white : .gray)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background(validateInputs() ? Color.black : Color.gray.opacity(0.3))
+
+            OnboardingButton(
+                label: "Continue",
+                style: primaryUseCase.isEmpty ? .disabled : .primary
+            ) {
+                guard !primaryUseCase.isEmpty else { return }
+                Haptics.impact(.medium)
+                withAnimation { page = 2 }
             }
-            .disabled(!validateInputs())
-            .padding(.horizontal, 30)
-            .padding(.bottom, 40)
+            .disabled(primaryUseCase.isEmpty)
+            .padding(.horizontal, 32)
+            .padding(.bottom, 52)
         }
     }
-    
-    // MARK: - Permissions Screen
-    
+
+    private let useCases = ["Work", "Journal", "Meetings", "Writing", "Study", "Memos"]
+
+    // MARK: - Permissions
+
     private var permissionsScreen: some View {
-        VStack(spacing: 30) {
-            HStack {
-                Button(action: { withAnimation { currentPage = 1 } }) {
-                    Image(systemName: "chevron.left")
-                        .font(.system(size: 16))
-                        .foregroundColor(.black)
-                }
-                Spacer()
-                Text("2/3")
-                    .font(.system(size: 12, weight: .light))
-                    .foregroundColor(.gray)
-            }
-            .padding()
-            
+        VStack(spacing: 0) {
+            stepHeader(back: { withAnimation { page = 1 } }, step: "2 / 3")
+
             Spacer()
-            
-            VStack(spacing: 40) {
-                Image(systemName: "lock")
-                    .font(.system(size: 40))
-                    .foregroundColor(.black)
-                
-                Text("Permissions")
-                    .font(.system(size: 24, weight: .light))
-                    .kerning(1)
-                
-                VStack(spacing: 20) {
+
+            VStack(spacing: 36) {
+                VStack(spacing: 8) {
+                    Image(systemName: "hand.raised")
+                        .font(.system(size: 36, weight: .ultraLight))
+                        .foregroundColor(.ink)
+
+                    Text("Permissions")
+                        .font(.serif(24, weight: .regular))
+                        .foregroundColor(.ink)
+
+                    Text("Required to record and transcribe")
+                        .font(.mono(12))
+                        .foregroundColor(.fog)
+                        .tracking(0.5)
+                }
+
+                VStack(spacing: 0) {
                     PermissionRow(
                         icon: "mic",
                         title: "Microphone",
-                        isGranted: microphonePermissionGranted,
-                        onRequest: requestMicrophonePermission
-                    )
-                    Divider().padding(.horizontal)
+                        detail: "To record your voice",
+                        isGranted: micGranted
+                    ) { requestMic() }
+
+                    Divider()
+                        .overlay(Color.inkLight.opacity(0.3))
+                        .padding(.horizontal, 32)
+
                     PermissionRow(
                         icon: "waveform",
                         title: "Speech Recognition",
-                        isGranted: speechPermissionGranted,
-                        onRequest: requestSpeechPermission
-                    )
+                        detail: "To transcribe in real time",
+                        isGranted: speechGranted
+                    ) { requestSpeech() }
+
+                    Divider()
+                        .overlay(Color.inkLight.opacity(0.3))
+                        .padding(.horizontal, 32)
+
+                    PermissionRow(
+                        icon: "bell",
+                        title: "Notifications",
+                        detail: "For save confirmations & reminders",
+                        isGranted: notifGranted
+                    ) { requestNotifications() }
                 }
-                .padding(.horizontal)
             }
-            
+
             Spacer()
-            
-            Button(action: { withAnimation { currentPage = 3 } }) {
-                Text("Continue")
-                    .font(.system(size: 14, weight: .regular))
-                    .foregroundColor((microphonePermissionGranted && speechPermissionGranted) ? .white : .gray)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background((microphonePermissionGranted && speechPermissionGranted) ? Color.black : Color.gray.opacity(0.3))
+
+            // Can proceed once mic + speech are granted; notifications are optional
+            let canProceed = micGranted && speechGranted
+
+            OnboardingButton(
+                label: "Continue",
+                style: canProceed ? .primary : .disabled
+            ) {
+                guard canProceed else { return }
+                Haptics.impact(.medium)
+                withAnimation { page = 3 }
             }
-            .disabled(!(microphonePermissionGranted && speechPermissionGranted))
-            .padding(.horizontal, 30)
-            .padding(.bottom, 40)
+            .disabled(!canProceed)
+            .padding(.horizontal, 32)
+
+            if !canProceed {
+                Text("Microphone and speech recognition are required")
+                    .font(.mono(10))
+                    .foregroundColor(.fog)
+                    .multilineTextAlignment(.center)
+                    .padding(.top, 10)
+                    .padding(.horizontal, 40)
+            }
+
+            Spacer().frame(height: 52)
         }
         .onAppear { checkPermissions() }
     }
-    
-    // MARK: - Features Carousel
-    
-    private var featuresCarousel: some View {
-        // featureIndex is currentPage offset by 3 (pages 0–2 are welcome/questions/permissions)
-        let featureIndex = currentPage - 3
+
+    // MARK: - Features
+
+    private var featuresScreen: some View {
+        let featureIndex = page - 3
 
         return VStack(spacing: 0) {
             HStack {
                 Spacer()
-                Button(action: completeOnboarding) {
+                Button {
+                    Haptics.impact(.light)
+                    completeOnboarding()
+                } label: {
                     Text("Skip")
-                        .font(.system(size: 14, weight: .light))
-                        .foregroundColor(.gray)
+                        .font(.mono(12))
+                        .foregroundColor(.fog)
+                        .tracking(1)
                 }
-                .padding()
+                .padding(28)
             }
-            
+
             Spacer()
-            
+
             TabView(selection: Binding(
                 get: { featureIndex },
-                set: { currentPage = $0 + 3 }
+                set: { newIndex in withAnimation { page = newIndex + 3 } }
             )) {
-                ForEach(0..<features.count, id: \.self) { index in
-                    FeatureMinimalView(feature: features[index])
-                        .tag(index)
+                ForEach(0..<features.count, id: \.self) { i in
+                    FeatureSlide(feature: features[i]).tag(i)
                 }
             }
             .tabViewStyle(.page(indexDisplayMode: .never))
-            .frame(height: 350)
-            
-            HStack(spacing: 6) {
-                ForEach(0..<features.count, id: \.self) { index in
-                    Circle()
-                        .fill(featureIndex == index ? Color.black : Color.gray.opacity(0.3))
-                        .frame(width: 6, height: 6)
+            .frame(height: 320)
+
+            // Dot indicators
+            HStack(spacing: 7) {
+                ForEach(0..<features.count, id: \.self) { i in
+                    Capsule()
+                        .fill(i == featureIndex ? Color.accent : Color.fog.opacity(0.3))
+                        .frame(width: i == featureIndex ? 20 : 6, height: 6)
+                        .animation(.spring(response: 0.3), value: featureIndex)
                 }
             }
-            .padding(.vertical, 30)
-            
-            Button(action: {
+            .padding(.top, 28)
+            .padding(.bottom, 36)
+
+            OnboardingButton(
+                label: featureIndex == features.count - 1 ? "Start recording" : "Next",
+                style: .primary
+            ) {
+                Haptics.impact(.medium)
                 if featureIndex < features.count - 1 {
-                    withAnimation { currentPage += 1 }
+                    withAnimation { page += 1 }
                 } else {
                     completeOnboarding()
                 }
-            }) {
-                Text(featureIndex == features.count - 1 ? "Get Started" : "Next")
-                    .font(.system(size: 14, weight: .regular))
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 16)
-                    .background(Color.black)
             }
-            .padding(.horizontal, 30)
-            .padding(.bottom, 40)
+            .padding(.horizontal, 32)
+            .padding(.bottom, 52)
         }
     }
-    
-    // MARK: - Helpers
-    
-    private var currentPageIndex: Int { currentPage - 3 }  // read-only, no setter needed
 
-    private func validateInputs() -> Bool { !primaryUseCase.isEmpty }
-    
-    private func checkPermissions() {
-        microphonePermissionGranted = AVAudioSession.sharedInstance().recordPermission == .granted
-        speechPermissionGranted = SFSpeechRecognizer.authorizationStatus() == .authorized
+    // MARK: - Shared Components
+
+    private func stepHeader(back: @escaping () -> Void, step: String) -> some View {
+        HStack {
+            Button(action: back) {
+                HStack(spacing: 6) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 14, weight: .light))
+                    Text("Back")
+                        .font(.serif(15))
+                }
+                .foregroundColor(.inkMid)
+            }
+            Spacer()
+            Text(step)
+                .font(.mono(11))
+                .foregroundColor(.fog)
+                .tracking(1)
+        }
+        .padding(.horizontal, 28)
+        .padding(.top, 58)
+        .padding(.bottom, 8)
     }
-    
-    private func requestMicrophonePermission() {
+
+    // MARK: - Permission Logic
+
+    private func checkPermissions() {
+        micGranted    = AVAudioSession.sharedInstance().recordPermission == .granted
+        speechGranted = SFSpeechRecognizer.authorizationStatus() == .authorized
+        UNUserNotificationCenter.current().getNotificationSettings { s in
+            DispatchQueue.main.async { notifGranted = s.authorizationStatus == .authorized }
+        }
+    }
+
+    private func requestMic() {
+        Haptics.impact(.light)
         AVAudioSession.sharedInstance().requestRecordPermission { granted in
             DispatchQueue.main.async {
-                microphonePermissionGranted = granted
+                micGranted = granted
                 if !granted {
-                    permissionAlertMessage = "Microphone access is required to record your voice."
-                    showingPermissionAlert = true
+                    settingsAlertMessage = "Microphone access is required to record your voice. Enable it in Settings."
+                    showSettingsAlert = true
+                } else {
+                    Haptics.notification(.success)
                 }
             }
         }
     }
-    
-    private func requestSpeechPermission() {
+
+    private func requestSpeech() {
+        Haptics.impact(.light)
         SFSpeechRecognizer.requestAuthorization { status in
             DispatchQueue.main.async {
-                speechPermissionGranted = status == .authorized
+                speechGranted = status == .authorized
                 if status != .authorized {
-                    permissionAlertMessage = "Speech recognition is required for transcription."
-                    showingPermissionAlert = true
+                    settingsAlertMessage = "Speech recognition is required for transcription. Enable it in Settings."
+                    showSettingsAlert = true
+                } else {
+                    Haptics.notification(.success)
                 }
             }
         }
     }
-    
+
+    private func requestNotifications() {
+        Haptics.impact(.light)
+        UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound, .badge]) { granted, _ in
+                DispatchQueue.main.async {
+                    notifGranted = granted
+                    if granted { Haptics.notification(.success) }
+                }
+            }
+    }
+
     private func completeOnboarding() {
         UserDefaults.standard.set(primaryUseCase, forKey: "primaryUseCase")
-        UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
-        withAnimation { hasCompletedOnboarding = true }
+        UserDefaults.standard.set(true,           forKey: "hasCompletedOnboarding")
+        Haptics.notification(.success)
+        withAnimation(.easeInOut(duration: 0.3)) { hasCompletedOnboarding = true }
+    }
+}
+
+// MARK: - Use Case Chip
+
+struct UseCaseChip: View {
+    let label: String
+    let isSelected: Bool
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            Text(label)
+                .font(.mono(13, weight: isSelected ? .medium : .regular))
+                .tracking(0.5)
+                .foregroundColor(isSelected ? .paper : .ink)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(isSelected ? Color.ink : Color.clear)
+                .overlay(
+                    Rectangle()
+                        .stroke(isSelected ? Color.ink : Color.inkLight.opacity(0.5), lineWidth: 1)
+                )
+        }
+        .buttonStyle(.plain)
     }
 }
 
@@ -334,71 +407,109 @@ struct OnboardingView: View {
 struct PermissionRow: View {
     let icon: String
     let title: String
+    let detail: String
     let isGranted: Bool
     let onRequest: () -> Void
-    
+
     var body: some View {
-        HStack {
-            Image(systemName: icon)
-                .frame(width: 24)
-                .foregroundColor(.black)
-            
-            Text(title)
-                .font(.system(size: 15, weight: .light))
-            
+        HStack(spacing: 16) {
+            Image(systemName: isGranted ? icon + ".fill" : icon)
+                .font(.system(size: 18, weight: .light))
+                .foregroundColor(isGranted ? .accent : .inkMid)
+                .frame(width: 28)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.serif(15))
+                    .foregroundColor(.ink)
+                Text(detail)
+                    .font(.mono(11))
+                    .foregroundColor(.fog)
+            }
+
             Spacer()
-            
+
             if isGranted {
                 Image(systemName: "checkmark")
-                    .font(.system(size: 12))
-                    .foregroundColor(.gray)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundColor(.accent)
             } else {
                 Button(action: onRequest) {
                     Text("Allow")
-                        .font(.system(size: 12, weight: .light))
-                        .foregroundColor(.black)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .overlay(Rectangle().stroke(Color.black, lineWidth: 1))
+                        .font(.mono(11, weight: .medium))
+                        .tracking(1)
+                        .foregroundColor(.ink)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 7)
+                        .overlay(Rectangle().stroke(Color.inkMid, lineWidth: 1))
                 }
+                .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 32)
+        .padding(.vertical, 16)
     }
 }
 
-// MARK: - Feature Model
+// MARK: - Feature Slide
 
 struct FeaturePage {
     let icon: String
     let title: String
-    let description: String
+    let detail: String
 }
 
-// MARK: - Feature View
-
-struct FeatureMinimalView: View {
+struct FeatureSlide: View {
     let feature: FeaturePage
-    
+
     var body: some View {
-        VStack(spacing: 30) {
-            Image(systemName: feature.icon)
-                .font(.system(size: 48))
-                .foregroundColor(.black)
-            
-            VStack(spacing: 12) {
+        VStack(spacing: 28) {
+            ZStack {
+                Circle()
+                    .fill(Color.inkLight.opacity(0.07))
+                    .frame(width: 88, height: 88)
+                Image(systemName: feature.icon)
+                    .font(.system(size: 36, weight: .ultraLight))
+                    .foregroundColor(.ink)
+            }
+
+            VStack(spacing: 10) {
                 Text(feature.title)
-                    .font(.system(size: 20, weight: .light))
-                    .kerning(1)
-                
-                Text(feature.description)
-                    .font(.system(size: 14))
-                    .foregroundColor(.gray)
+                    .font(.serif(22, weight: .regular))
+                    .foregroundColor(.ink)
+                    .kerning(0.5)
+
+                Text(feature.detail)
+                    .font(.mono(13))
+                    .foregroundColor(.fog)
                     .multilineTextAlignment(.center)
-                    .padding(.horizontal, 40)
-                    .lineSpacing(4)
+                    .lineSpacing(5)
+                    .padding(.horizontal, 48)
             }
         }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+// MARK: - Onboarding Button
+
+enum OnboardingButtonStyle { case primary, disabled }
+
+struct OnboardingButton: View {
+    let label: String
+    let style: OnboardingButtonStyle
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.mono(13, weight: .medium))
+                .tracking(1.5)
+                .foregroundColor(style == .primary ? .paper : .fog)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 17)
+                .background(style == .primary ? Color.ink : Color.inkLight.opacity(0.15))
+        }
+        .buttonStyle(.plain)
     }
 }
